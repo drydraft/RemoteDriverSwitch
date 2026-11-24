@@ -114,6 +114,7 @@ namespace RemoteDriverSwitch
         void StopApp(string name);
         void StartApp(string name);
         void CloseRemoteProcesses();
+        void CloseRemoteProcesses(IEnumerable<string> products);
         List<StartupEntry> StartupEntries();
         StartupEntry ReadStartup(StartupEntry entry);
         void SetStartup(StartupEntry entry,bool enabled);
@@ -412,6 +413,44 @@ namespace RemoteDriverSwitch
                     Note("已恢复"+StartupLabel(startup));
                 }catch(Exception error){failures.Add(StartupLabel(startup)+"恢复未完成："+error.Message);}
             }
+        }
+        private List<StartupEntry> SaveRepairCandidates(Snapshot snapshot,IEnumerable<StartupEntry> candidates)
+        {
+            var originals=snapshot.Startups.ToDictionary(entry=>entry.Identity,StringComparer.OrdinalIgnoreCase);
+            var present=new List<StartupEntry>();
+            bool added=false;
+            foreach(var entry in candidates) {
+                WindowsStartup.Validate(entry);
+                StartupEntry original;
+                if(originals.TryGetValue(entry.Identity,out original)&&!original.Matches(entry))
+                    throw new IOException(StartupLabel(entry)+"与原备份不同，请先核对。");
+                if(VerifyStartupSlot(entry)==null)continue;
+                if(original==null){original=entry;originals.Add(entry.Identity,original);added=true;}
+                present.Add(original);
+            }
+            if(added) {
+                snapshot.Startups=originals.Values.ToList();snapshot.Version=2;
+                Validate(snapshot);
+                store.Save(snapshot);
+            }
+            return present;
+        }
+        // Call only for the matching, pending game mode restart verification.
+        public bool RepairStartupAfterReboot(Snapshot snapshot,ScanResult scan)
+        {
+            if(snapshot==null||snapshot.Phase!="Protected"||scan==null||scan.Startups.Count==0||
+                string.IsNullOrEmpty(scan.BootId)||snapshot.AppliedBoot==scan.BootId||scan.BootId!=platform.BootId)return false;
+            Validate(snapshot);
+            var present=SaveRepairCandidates(snapshot,scan.Startups);
+            if(present.Count==0)return false;
+            Note("重启核验发现远控登录启动项重新出现，开始补处理。");
+            foreach(var entry in present)SuppressStartup(entry);
+            var products=new HashSet<string>(present.Select(entry=>entry.ProductId),StringComparer.OrdinalIgnoreCase);
+            platform.CloseRemoteProcesses(products);
+            // A client can write its startup value back while exiting.
+            foreach(var entry in SaveRepairCandidates(snapshot,platform.StartupEntries().Where(entry=>products.Contains(entry.ProductId))))
+                SuppressStartup(entry);
+            return true;
         }
         public Snapshot Protect()
         {

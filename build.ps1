@@ -6,7 +6,7 @@ $outputDirectory = Join-Path $projectRoot $OutputFolder
 New-Item -ItemType Directory -Path $buildDirectory,$outputDirectory -Force | Out-Null
 $compiler = Join-Path $env:windir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $sourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src') -Filter '*.cs' | ForEach-Object FullName)
-$references = @('/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll','/reference:System.ServiceProcess.dll','/reference:System.Management.dll','/reference:System.Web.Extensions.dll','/reference:Microsoft.CSharp.dll')
+$references = @('/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll','/reference:System.ServiceProcess.dll','/reference:System.Management.dll','/reference:System.Web.Extensions.dll','/reference:System.IO.Compression.dll','/reference:Microsoft.CSharp.dll')
 Add-Type -AssemblyName System.Drawing
 $iconFile=Join-Path $buildDirectory 'app.ico'
 $bitmap=New-Object System.Drawing.Bitmap 64,64

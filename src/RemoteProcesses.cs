@@ -122,19 +122,27 @@ namespace RemoteDriverSwitch
             }
         }
         public List<RemoteInstallRoot> DiscoverRoots()
+        {return DiscoverRoots(null,null);}
+        private List<RemoteInstallRoot> DiscoverRoots(HashSet<string> products,int? session)
         {
             var roots=new List<RemoteInstallRoot>();var services=new Dictionary<string,ServiceState>(StringComparer.OrdinalIgnoreCase);
             foreach(string name in Catalog.AppServices.Keys) {
+                string product=Catalog.AppProduct(name);
+                if(products!=null&&!products.Contains(product))continue;
                 var state=platform.Service(name);if(state==null)continue;services[name]=state;
                 string executable=SoftwareInventory.ExecutablePath(state.ImagePath);
-                if(Catalog.AppExeMatches(name,Path.GetFileName(executable)))AddCandidate(roots,Catalog.AppProduct(name),Path.GetDirectoryName(executable));
+                if(Catalog.AppExeMatches(name,Path.GetFileName(executable)))AddCandidate(roots,product,Path.GetDirectoryName(executable));
             }
             var warnings=new List<string>();
-            foreach(var software in SoftwareInventory.Read(new List<Device>(),services,warnings))if(software.Installed)AddCandidate(roots,software.Id,software.InstallPath);
+            foreach(var software in SoftwareInventory.Read(new List<Device>(),services,warnings))
+                if(software.Installed&&(products==null||products.Contains(software.Id)))AddCandidate(roots,software.Id,software.InstallPath);
             foreach(var process in Process.GetProcesses())using(process) {
                 string product=null;
                 try {
-                    product=NameProduct(process.ProcessName);if(product==null)continue;var identity=ReadIdentity(process);
+                    product=NameProduct(process.ProcessName);
+                    if(product==null||(products!=null&&!products.Contains(product)))continue;
+                    if(!SessionMatches(session,process))continue;
+                    var identity=ReadIdentity(process);
                     AddCandidate(roots,product,Path.GetDirectoryName(identity.ExecutablePath));
                     if(!roots.Any(r=>r.ProductId==product&&RemoteProcessRules.IsUnderRoot(identity.ExecutablePath,r.Path))) {
                         var version=Version(identity.ExecutablePath);
@@ -159,14 +167,19 @@ namespace RemoteDriverSwitch
                 long created,ended,kernel,user;if(!GetProcessTimes(handle,out created,out ended,out kernel,out user))throw new Win32Exception(Marshal.GetLastWin32Error());
                 return new RemoteProcessInfo {Id=id,Name=Path.GetFileName(path.ToString()),ExecutablePath=path.ToString(),StartTimeUtc=DateTime.FromFileTimeUtc(created).ToString("o")};
         }
-        private List<RemoteProcessInfo> Find(List<RemoteInstallRoot> roots)
+        internal static bool SessionMatches(int? session,Process process)
+        {return !session.HasValue||process.SessionId==session.Value;}
+        private List<RemoteProcessInfo> Find(List<RemoteInstallRoot> roots,HashSet<string> products=null,int? session=null)
         {
             var targets=new List<RemoteProcessInfo>();int ownId;using(var own=Process.GetCurrentProcess())ownId=own.Id;
             foreach(var process in Process.GetProcesses())using(process) {
                 if(process.Id==ownId)continue;
                 string hint=null;
                 try {
-                    hint=NameProduct(process.ProcessName);var info=ReadIdentity(process);
+                    hint=NameProduct(process.ProcessName);
+                    if(products!=null&&hint!=null&&!products.Contains(hint))continue;
+                    if(!SessionMatches(session,process))continue;
+                    var info=ReadIdentity(process);
                     var root=roots.Where(r=>RemoteProcessRules.IsUnderRoot(info.ExecutablePath,r.Path)).OrderByDescending(r=>r.Path.Length).FirstOrDefault();
                     if(root==null) {
                         if(hint!=null) {
@@ -177,6 +190,8 @@ namespace RemoteDriverSwitch
                     }
                     info.ProductId=root.ProductId;
                     var version=Version(info.ExecutablePath);info.Company=version.CompanyName;info.ProductName=version.ProductName;info.OriginalFileName=version.OriginalFilename;
+                    if(products!=null&&Anchors.Keys.Any(product=>!products.Contains(product)&&RemoteProcessRules.IsVendorIdentity(product,info.Company,info.ProductName)))
+                        continue;
                     if(!RemoteProcessRules.CanClose(info,roots))throw new IOException((RemoteProcessRules.IsMaintenance(info.ExecutablePath)?"检测到远控安装或驱动维护进程，请等待完成":"检测到远控目录中尚未适配的后台进程，请手动退出")+"："+info.ExecutablePath+"（PID "+info.Id+"）。尚未继续处理驱动。");
                     FileStore.CheckDirectoryPath(Path.GetDirectoryName(info.ExecutablePath));
                     if((File.GetAttributes(info.ExecutablePath)&FileAttributes.ReparsePoint)!=0)throw new IOException("进程文件使用链接，无法核验："+info.ExecutablePath);
@@ -196,7 +211,7 @@ namespace RemoteDriverSwitch
             return default(T);
         }
 
-        private Process OpenCurrent(RemoteProcessInfo expected,List<RemoteInstallRoot> roots)
+        private Process OpenCurrent(RemoteProcessInfo expected,List<RemoteInstallRoot> roots,int? session)
         {
             Process process;
             try{process=Process.GetProcessById(expected.Id);}catch(ArgumentException){return null;}
@@ -204,7 +219,7 @@ namespace RemoteDriverSwitch
                 var current=InvokeWhileRunning(process,()=>{
                     // Pin this process before reading its identity; Close/Kill reuse that handle.
                     IntPtr pinned=process.Handle;
-                    return Exited(process)?null:ReadIdentity(pinned,expected.Id);
+                    return Exited(process)||!SessionMatches(session,process)?null:ReadIdentity(pinned,expected.Id);
                 });
                 if(current==null){process.Dispose();return null;}
                 current.ProductId=expected.ProductId;
@@ -215,13 +230,26 @@ namespace RemoteDriverSwitch
             }catch{process.Dispose();throw;}
         }
         public void Close()
+        {CloseSelected(null);}
+        public void Close(IEnumerable<string> products)
         {
-            var roots=DiscoverRoots();var watch=Stopwatch.StartNew();
+            if(products==null)throw new ArgumentNullException("products");
+            var selected=new HashSet<string>(products,StringComparer.Ordinal);
+            if(selected.Any(product=>product==null||!Anchors.ContainsKey(product)))
+                throw new ArgumentException("远控产品不在支持列表中。","products");
+            if(selected.Count>0)CloseSelected(selected);
+        }
+        private void CloseSelected(HashSet<string> products)
+        {
+            int? session=null;
+            if(products!=null)using(var current=Process.GetCurrentProcess())session=current.SessionId;
+            var roots=DiscoverRoots(products,session);var watch=Stopwatch.StartNew();
+            string completed=products==null?"已确认三款远控的已识别后台进程全部退出。":"已确认本次登录会话中指定远控的已识别后台进程全部退出。";
             for(int pass=0;pass<3;pass++) {
-                var targets=Find(roots);if(targets.Count==0){Trace("已确认三款远控的已识别后台进程全部退出。");return;}
+                var targets=Find(roots,products,session);if(targets.Count==0){Trace(completed);return;}
                 foreach(var target in targets) {
                     if(watch.ElapsedMilliseconds>=20000)throw new IOException("等待远控进程退出超时，尚未继续处理驱动。");
-                    using(var process=OpenCurrent(target,roots))if(process!=null) {
+                    using(var process=OpenCurrent(target,roots,session))if(process!=null) {
                         Trace("请求退出远控进程："+target.ProductId+" | PID "+target.Id+" | "+target.ExecutablePath);
                         InvokeWhileRunning(process,process.CloseMainWindow);
                     }
@@ -229,7 +257,7 @@ namespace RemoteDriverSwitch
                 Thread.Sleep(350);
                 foreach(var target in targets) {
                     int remaining=(int)(20000-watch.ElapsedMilliseconds);if(remaining<=0)throw new IOException("等待远控进程退出超时，尚未继续处理驱动。");
-                    using(var process=OpenCurrent(target,roots))if(process!=null) {
+                    using(var process=OpenCurrent(target,roots,session))if(process!=null) {
                         Trace("结束仍在运行的远控进程："+target.ProductId+" | PID "+target.Id+" | "+target.ExecutablePath);
                         InvokeWhileRunning(process,()=>{
                             process.Kill();
@@ -240,9 +268,9 @@ namespace RemoteDriverSwitch
                 }
                 Thread.Sleep(200);
             }
-            var remainingProcesses=Find(roots);
+            var remainingProcesses=Find(roots,products,session);
             if(remainingProcesses.Count>0)throw new IOException("远控后台进程退出后重新出现，尚未继续处理驱动："+string.Join("、",remainingProcesses.Select(p=>p.Name+" ("+p.Id+")")));
-            Trace("已确认三款远控的已识别后台进程全部退出。");
+            Trace(completed);
         }
         [DllImport("kernel32.dll",SetLastError=true)]private static extern IntPtr OpenProcess(uint access,bool inherit,int id);
         [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]private static extern bool QueryFullProcessImageName(IntPtr process,uint flags,StringBuilder name,ref uint size);

@@ -106,6 +106,8 @@ namespace RemoteDriverSwitch
         }
         public void CloseRemoteProcesses()
         {new RemoteProcessController(this,Trace).Close();}
+        public void CloseRemoteProcesses(IEnumerable<string> products)
+        {new RemoteProcessController(this,Trace).Close(products);}
         public List<StartupEntry> StartupEntries(){return WindowsStartup.Read();}
         public StartupEntry ReadStartup(StartupEntry entry){return WindowsStartup.ReadSlot(entry);}
         public void SetStartup(StartupEntry entry,bool enabled){WindowsStartup.SetEnabled(entry,enabled);}

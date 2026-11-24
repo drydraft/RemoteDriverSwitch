@@ -29,15 +29,35 @@ namespace RemoteDriverSwitch
             }
             return Tests.Run(args.Length>0?args[0]:null);
 #else
+            if(args.Length>0&&args[0]=="--apply-update")return PortableUpdate.Apply(args);
+            IDisposable updateReceipt=null;
+            if(args.Length>0&&args[0]=="--finish-update") {
+                try {if(!PortableUpdate.Resume(args,out updateReceipt))return 1;}
+                catch(Exception){return 1;}
+            }
+            using(updateReceipt)return RunUi(args,updateReceipt);
+#endif
+        }
+#if !TESTS
+        private static bool UpdateInProgress()
+        {
+            Mutex updateGate;
+            if(!Mutex.TryOpenExisting(PortableUpdate.GateName,out updateGate))return false;
+            updateGate.Dispose();return true;
+        }
+        private static int RunUi(string[] args,IDisposable updateReceipt)
+        {
             Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
             bool preview=false;
 #if PREVIEW
             preview=true;
 #endif
             preview|=args.Contains("--preview")||args.Contains("--render-preview")||args.Contains("--ui-smoke");
+            if(!preview&&updateReceipt==null&&UpdateInProgress())return 0;
             string instance=preview?"Local\\RemoteDriverSwitch.Preview.v2":"Global\\RemoteDriverSwitch.Ui.v2";bool created;
             using(var mutex=new Mutex(true,instance,out created))using(var activation=new EventWaitHandle(false,EventResetMode.AutoReset,instance+".Activate")) {
                 if(!created){activation.Set();return 0;}
+                if(!preview&&updateReceipt==null&&UpdateInProgress())return 0;
                 try {
                     IPlatform platform;IStore store;string dataPath;
                     if(preview){platform=new FakePlatform();store=new MemoryStore();dataPath="模拟预览";}
@@ -45,8 +65,10 @@ namespace RemoteDriverSwitch
                         if(!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))throw new InvalidOperationException("请右键程序，选择“以管理员身份运行”。");
                         platform=new WindowsPlatform();dataPath=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),"RemoteDriverSwitch");store=new FileStore(dataPath,true);
                     }
-                    using(var form=new MainForm(platform,store,dataPath,preview)) {
+                    string portablePath=updateReceipt==null?Application.ExecutablePath:PortableUpdate.TargetPath(updateReceipt);
+                    using(var form=new MainForm(platform,store,dataPath,preview,portablePath)) {
                         var handle=form.Handle;
+                        if(updateReceipt!=null)form.Shown+=(sender,e)=>PortableUpdate.Ready(updateReceipt);
                         var wait=ThreadPool.RegisterWaitForSingleObject(activation,(state,timedOut)=>{try{form.BeginInvoke((Action)form.ShowMain);}catch(InvalidOperationException){}},null,Timeout.Infinite,false);
                         try {
                             if(args.Contains("--render-preview")||args.Contains("--ui-smoke")) {
@@ -56,7 +78,7 @@ namespace RemoteDriverSwitch
                                     form.RestoreWindow();Application.DoEvents();if(!form.Visible)throw new Exception("托盘恢复窗口检查失败。");
                                     var update=form.Controls.OfType<Button>().Single(button=>button.Text=="检查更新");
                                     form.RecordUpdate(new Version(9,0,0));
-                                    if(update.Text!="下载新版"||!update.Enabled)throw new Exception("更新下载入口未显示。");
+                                    if(update.Text!="立即更新"||!update.Enabled)throw new Exception("立即更新入口未显示。");
                                     form.RecordUpdate(null);
                                     if(update.Text!="检查更新")throw new Exception("更新检查入口未恢复。");
                                     File.WriteAllText(args[args.Length-1],"PASS compact window "+form.ClientSize+Environment.NewLine+"PASS close hides window and keeps tray"+Environment.NewLine+"PASS show restores window"+Environment.NewLine+"PASS update and download controls");
@@ -69,13 +91,13 @@ namespace RemoteDriverSwitch
                     return 0;
                 }catch(Exception ex){MessageBox.Show(ex.Message,"远控驱动开关",MessageBoxButtons.OK,MessageBoxIcon.Error);return 1;}
             }
-#endif
         }
+#endif
     }
     public sealed class MainForm : Form
     {
         private readonly IPlatform platform;private readonly IStore store;private readonly SwitchEngine engine;private readonly WindowsResume resume;
-        private readonly string dataPath;private readonly bool preview;
+        private readonly string dataPath,portablePath;private readonly bool preview;
         private Label computer,mode,summary,backupInfo;private readonly Dictionary<string,Label> softwareLabels=new Dictionary<string,Label>();
         private Button protect,restore,refresh,logs,updateButton;private ListView list;private TextBox activity;
         private readonly ToolTip tips=new ToolTip();private NotifyIcon tray;private ContextMenuStrip trayMenu;
@@ -84,12 +106,12 @@ namespace RemoteDriverSwitch
         private static readonly Version AppVersion=new Version(typeof(Program).Assembly.GetName().Version.ToString(3));
         private Version availableUpdate;
         private readonly HashSet<Version> notifiedUpdates=new HashSet<Version>();
-        private bool checkingUpdate;
+        private bool checkingUpdate,installingUpdate;
         private bool busy,exitRequested,initialScan=true,allowProtect,allowRestore;
         public bool TrayVisible {get{return tray!=null&&tray.Visible;}}
-        public MainForm(IPlatform platform,IStore store,string dataPath,bool preview)
+        public MainForm(IPlatform platform,IStore store,string dataPath,bool preview,string portablePath=null)
         {
-            this.platform=platform;this.store=store;this.dataPath=dataPath;this.preview=preview;engine=new SwitchEngine(platform,store);if(!preview)resume=new WindowsResume(dataPath);
+            this.platform=platform;this.store=store;this.dataPath=dataPath;this.preview=preview;this.portablePath=portablePath??Application.ExecutablePath;engine=new SwitchEngine(platform,store);if(!preview)resume=new WindowsResume(dataPath);
             Text="远控驱动开关 "+AppVersion+(preview?"（预览）":"");Font=SystemFonts.MessageBoxFont;
             AutoScaleMode=AutoScaleMode.Dpi;ClientSize=new Size(740,576);FormBorderStyle=FormBorderStyle.FixedSingle;MaximizeBox=false;StartPosition=FormStartPosition.CenterScreen;
             BackColor=SystemColors.Control;ForeColor=SystemColors.ControlText;
@@ -129,7 +151,7 @@ namespace RemoteDriverSwitch
             activity=new TextBox {Location=new Point(12,458),Size=new Size(716,76),Multiline=true,ReadOnly=true,ScrollBars=ScrollBars.Vertical,BackColor=SystemColors.Window,BorderStyle=BorderStyle.Fixed3D};Controls.Add(activity);
             AddLabel(this,"关闭窗口后驻留托盘；右键托盘图标可退出。",14,546,476,20);
             updateButton=ButtonAt("检查更新",506,541,112);
-            updateButton.Click+=async(s,e)=>{if(availableUpdate!=null)OpenUpdate();else await CheckUpdates(true);};
+            updateButton.Click+=async(s,e)=>{if(availableUpdate!=null)await InstallUpdate();else await CheckUpdates(true);};
             var exit=ButtonAt("退出",628,541,100);exit.Click+=(s,e)=>ExitApplication();
         }
         private void BuildTray()
@@ -140,10 +162,10 @@ namespace RemoteDriverSwitch
             trayRestore=new ToolStripMenuItem("恢复并重启（远控）",null,async(s,e)=>{RestoreWindow();await Switch(false);});trayMenu.Items.Add(trayRestore);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayUpdate=new ToolStripMenuItem("检查更新",null,async(s,e)=>{RestoreWindow();await CheckUpdates(true);});trayMenu.Items.Add(trayUpdate);
-            trayDownload=new ToolStripMenuItem("下载新版",null,(s,e)=>OpenUpdate()) {Visible=false};trayMenu.Items.Add(trayDownload);
+            trayDownload=new ToolStripMenuItem("立即更新",null,async(s,e)=>await InstallUpdate()) {Visible=false};trayMenu.Items.Add(trayDownload);
             trayMenu.Items.Add(new ToolStripSeparator());trayExit=new ToolStripMenuItem("退出",null,(s,e)=>ExitApplication());trayMenu.Items.Add(trayExit);
             tray=new NotifyIcon {Text="远控驱动开关",Icon=Icon??SystemIcons.Application,Visible=true,ContextMenuStrip=trayMenu};tray.DoubleClick+=(s,e)=>ShowMain();
-            tray.BalloonTipClicked+=(s,e)=>OpenUpdate();
+            tray.BalloonTipClicked+=(s,e)=>RestoreWindow();
         }
         public async void ShowMain(){RestoreWindow();if(!busy)await RefreshAsync();}
         public void RestoreWindow(){Show();WindowState=FormWindowState.Normal;Activate();BringToFront();}
@@ -152,12 +174,13 @@ namespace RemoteDriverSwitch
         {if(disposing){if(updateTimer!=null)updateTimer.Dispose();if(tray!=null){tray.Visible=false;tray.Dispose();}if(trayMenu!=null)trayMenu.Dispose();tips.Dispose();}base.Dispose(disposing);}
         private void RenderUpdateControls()
         {
-            updateButton.Text=availableUpdate!=null?"下载新版":checkingUpdate?"检查中…":"检查更新";
-            updateButton.Enabled=availableUpdate!=null||!checkingUpdate;
-            tips.SetToolTip(updateButton,availableUpdate==null?"检查 GitHub 上的正式版本":"前往 GitHub 下载 v"+availableUpdate);
-            trayUpdate.Enabled=!checkingUpdate;
+            updateButton.Text=installingUpdate?"正在更新…":availableUpdate!=null?"立即更新":checkingUpdate?"检查中…":"检查更新";
+            updateButton.Enabled=!busy&&(availableUpdate!=null||!checkingUpdate);
+            tips.SetToolTip(updateButton,availableUpdate==null?"检查 GitHub 上的正式版本":"下载并安装 v"+availableUpdate);
+            trayUpdate.Enabled=!busy&&!checkingUpdate;
             trayDownload.Visible=availableUpdate!=null;
-            if(availableUpdate!=null)trayDownload.Text="下载新版 v"+availableUpdate;
+            trayDownload.Enabled=!busy;
+            if(availableUpdate!=null)trayDownload.Text="立即更新到 v"+availableUpdate;
         }
         internal void RecordUpdate(Version found)
         {
@@ -165,11 +188,11 @@ namespace RemoteDriverSwitch
             RenderUpdateControls();
             if(found==null||!notifiedUpdates.Add(found))return;
             Append("发现新版 v"+found+"。");
-            if(!preview)tray.ShowBalloonTip(6000,"远控驱动开关有新版","v"+found+" 已发布，点击打开下载页。",ToolTipIcon.Info);
+            if(!preview)tray.ShowBalloonTip(6000,"远控驱动开关有新版","v"+found+" 已发布，点击打开更新入口。",ToolTipIcon.Info);
         }
         private async Task CheckUpdates(bool manual)
         {
-            if(checkingUpdate)return;
+            if(checkingUpdate||installingUpdate)return;
             checkingUpdate=true;RenderUpdateControls();
             try {
                 var found=preview?null:await Task.Run(()=>ReleaseUpdates.Check(AppVersion));
@@ -183,10 +206,31 @@ namespace RemoteDriverSwitch
                 if(!IsDisposed&&!Disposing)RenderUpdateControls();
             }
         }
-        private void OpenUpdate()
+        private async Task InstallUpdate()
         {
-            if(preview||availableUpdate==null)return;
-            try {using(var browser=Process.Start(new ProcessStartInfo {FileName=ReleaseUpdates.Page(availableUpdate),UseShellExecute=true})){}}
+            if(preview||busy||availableUpdate==null)return;
+            RestoreWindow();
+            var version=availableUpdate;
+            string executable=portablePath;
+            if(!PortableUpdate.IsAvailable(dataPath,executable)) {
+                if(MessageBox.Show(this,"当前无法就地更新。请等重启核验结束，从托盘退出工具，再从可写文件夹打开原便携版。\n\n现在打开 GitHub 下载页？","立即更新",MessageBoxButtons.YesNo,MessageBoxIcon.Information)==DialogResult.Yes)OpenReleasePage(version);
+                return;
+            }
+            installingUpdate=true;
+            SetBusy(true);
+            Append("正在下载并校验 v"+version+"。");
+            try {
+                await Task.Run(()=>PortableUpdate.Start(version,dataPath,executable));
+                exitRequested=true;Close();
+            }catch(Exception error) {
+                installingUpdate=false;SetBusy(false);
+                Append("更新未完成："+error.Message);
+                if(MessageBox.Show(this,error.Message+"\n\n打开 GitHub 下载页？","更新未完成",MessageBoxButtons.YesNo,MessageBoxIcon.Information)==DialogResult.Yes)OpenReleasePage(version);
+            }
+        }
+        private void OpenReleasePage(Version version)
+        {
+            try {using(var browser=Process.Start(new ProcessStartInfo {FileName=ReleaseUpdates.Page(version),UseShellExecute=true})){}}
             catch(System.ComponentModel.Win32Exception) {
                 MessageBox.Show("无法打开浏览器。可以在 GitHub 搜索 drydraft/RemoteDriverSwitch 查看新版。","打开下载页",MessageBoxButtons.OK,MessageBoxIcon.Information);
             }
@@ -194,7 +238,7 @@ namespace RemoteDriverSwitch
         private void Append(string text)
         {if(activity.TextLength>32000)activity.Text=activity.Text.Substring(activity.TextLength-16000);activity.AppendText(DateTime.Now.ToString("HH:mm:ss")+"  "+text+Environment.NewLine);}
         private void SetBusy(bool value)
-        {busy=value;protect.Enabled=trayProtect.Enabled=!value&&allowProtect;restore.Enabled=trayRestore.Enabled=!value&&allowRestore;refresh.Enabled=logs.Enabled=trayRefresh.Enabled=trayExit.Enabled=!value;UseWaitCursor=value;}
+        {busy=value;protect.Enabled=trayProtect.Enabled=!value&&allowProtect;restore.Enabled=trayRestore.Enabled=!value&&allowRestore;refresh.Enabled=logs.Enabled=trayRefresh.Enabled=trayExit.Enabled=!value;UseWaitCursor=value;RenderUpdateControls();}
         public void RefreshData()
         {
             initialScan=false;SetBusy(true);try{var scan=ScanResult.Capture(platform);var snapshot=engine.ReconcileRestoredDevices(engine.Current(),scan);ApplyScan(scan,snapshot,snapshot==null?new List<string>():engine.ConfigurationDrift(snapshot,scan));}finally{SetBusy(false);}
@@ -203,9 +247,17 @@ namespace RemoteDriverSwitch
         {
             if(busy&&!startup)return;SetBusy(true);mode.Text="正在扫描本机…";
             try {
-                Snapshot snapshot=null;List<string> drift=null;string continuationError=null;
+                Snapshot snapshot=null;List<string> drift=null;string continuationError=null,startupRepairError=null;bool startupRepaired=false;
                 var scan=await Task.Run(()=>{
                     var value=ScanResult.Capture(platform);snapshot=engine.ReconcileRestoredDevices(engine.Current(),value);
+                    if(resume!=null&&snapshot!=null&&snapshot.Phase=="Protected"&&snapshot.AppliedBoot!=value.BootId) {
+                        var pending=resume.Pending(platform);
+                        if(WindowsResume.Ready(pending,value.BootId)&&WindowsResume.GoalMatches(pending,snapshot)&&pending.BootBefore==snapshot.AppliedBoot) {
+                            try {startupRepaired=engine.RepairStartupAfterReboot(snapshot,value);}
+                            catch(Exception error){startupRepairError="远控自启补处理未完成："+error.Message;try{store.Log(startupRepairError);}catch(IOException){}catch(UnauthorizedAccessException){}}
+                            if(startupRepaired||startupRepairError!=null){snapshot=engine.Current();value=ScanResult.Capture(platform);}
+                        }
+                    }
                     if(resume!=null&&snapshot!=null&&snapshot.Phase=="Restored"&&snapshot.PendingDevices.Count>0&&snapshot.AppliedBoot!=value.BootId) {
                         var pending=resume.Pending(platform);
                         if(WindowsResume.Ready(pending,value.BootId)&&WindowsResume.GoalMatches(pending,snapshot)) {
@@ -216,8 +268,10 @@ namespace RemoteDriverSwitch
                             value=ScanResult.Capture(platform);
                         }
                     }
-                    drift=snapshot==null?new List<string>():engine.ConfigurationDrift(snapshot,value);return value;
-                });ApplyScan(scan,snapshot,drift);if(continuationError!=null)Append("恢复仍需处理："+continuationError);
+                    drift=snapshot==null?new List<string>():engine.ConfigurationDrift(snapshot,value);
+                    if(startupRepairError!=null)drift.Insert(0,startupRepairError);
+                    return value;
+                });ApplyScan(scan,snapshot,drift);if(startupRepaired)Append("已补处理重新出现的远控登录启动项，并重新扫描。");if(continuationError!=null)Append("恢复仍需处理："+continuationError);
             }catch(Exception error){allowProtect=allowRestore=false;mode.Text="扫描未完成";summary.Text=error.Message;tips.SetToolTip(summary,error.ToString());Append(error.Message);}finally{SetBusy(false);}
         }
         private static string StartText(int start){return start==4?"禁用":start==0?"引导":start==1?"系统":start==2?"自动":"手动";}
@@ -273,7 +327,7 @@ namespace RemoteDriverSwitch
         private async Task Switch(bool game)
         {
             if(busy||(game?!allowProtect:!allowRestore))return;
-            string text=game?"将保存本机原始配置，停用已识别的远控登录启动项和服务，关闭后台进程，然后禁用对应驱动组件。\n远控连接和这三款软件正在执行的任务会中断。":"将按本机备份恢复设备、远控服务和登录启动项的原始配置。";
+            string text=game?"将保存本机原始配置，停用已识别的远控登录启动项和服务，关闭后台进程，然后禁用对应驱动组件。\n远控连接和这三款软件正在执行的任务会中断。重启后如发现已识别的启动项回写，工具会自动补处理。":"将按本机备份恢复设备、远控服务和登录启动项的原始配置。";
             if(MessageBox.Show(this,text+"\n\n完成后进入重启倒计时。请先保存文件。登录桌面后，工具将自动打开并核验。",game?"禁用并重启":"恢复并重启",MessageBoxButtons.OKCancel,MessageBoxIcon.Warning)!=DialogResult.OK)return;
             SetBusy(true);mode.Text="正在切换，请稍候…";
             Exception failure=null;

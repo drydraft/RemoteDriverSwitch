@@ -25,6 +25,7 @@ namespace RemoteDriverSwitch
         public Dictionary<string,ServiceState> Services=new Dictionary<string,ServiceState>(StringComparer.OrdinalIgnoreCase);
         public List<string> Calls=new List<string>();
         public readonly List<StartupEntry> StartupValues=new List<StartupEntry>();
+        public readonly HashSet<string> RunningClients=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         public Action<StartupEntry,bool> BeforeStartupChange;
         public Action ClosingRemoteProcesses;
         public static readonly string[] DefaultTargetIds={"uu-hid","uu-filter","uu-display","oray-usb","oray-gamepad","oray-display","td-audio"};
@@ -77,7 +78,7 @@ namespace RemoteDriverSwitch
             foreach(string id in new[]{"uu","oray","td"}) {
                 var apps=Catalog.AppServices.Keys.Where(k=>Catalog.AppProduct(k)==id&&Services.ContainsKey(k)).Select(k=>Services[k]).ToList();
                 bool installed=apps.Count>0||devices.Any(d=>Catalog.DeviceProduct(d)==id);string image=apps.Count>0?apps[0].ImagePath:"";string exe=image.StartsWith("\"")?image.Split('"')[1]:image;
-                result.Add(new SoftwareInfo {Id=id,Name=id=="uu"?"UU远程":id=="oray"?"向日葵":"ToDesk",Version=installed?"simulation-1.0":"",InstallPath=string.IsNullOrEmpty(exe)?"":Path.GetDirectoryName(exe),Installed=installed,ServiceDetected=apps.Count>0,ServiceRunning=apps.Any(a=>a.Running),Evidence=new List<string>{installed?"模拟服务或已识别设备":"未发现模拟安装"}});
+                result.Add(new SoftwareInfo {Id=id,Name=id=="uu"?"UU远程":id=="oray"?"向日葵":"ToDesk",Version=installed?"simulation-1.0":"",InstallPath=string.IsNullOrEmpty(exe)?"":Path.GetDirectoryName(exe),Installed=installed,ProcessRunning=RunningClients.Contains(id),ServiceDetected=apps.Count>0,ServiceRunning=apps.Any(a=>a.Running),Evidence=new List<string>{installed?"模拟服务或已识别设备":"未发现模拟安装"}});
             }
             return result;
         }
@@ -119,6 +120,14 @@ namespace RemoteDriverSwitch
             if(!enabled&&current!=null)StartupValues.RemoveAll(value=>SameStartupSlot(value,entry));
         }
         public void CloseRemoteProcesses(){Calls.Add("close-processes");if(ClosingRemoteProcesses!=null)ClosingRemoteProcesses();if(ProcessCloseHideTarget!=null)Items.RemoveAll(d=>d.InstanceId==ProcessCloseHideTarget);if(ProcessCloseFailure)throw new IOException("模拟远控进程仍被占用或反复重启");}
+        public void CloseRemoteProcesses(IEnumerable<string> products)
+        {
+            var targets=products.ToList();
+            Calls.Add("close-processes:"+string.Join(",",targets));
+            if(ClosingRemoteProcesses!=null)ClosingRemoteProcesses();
+            if(ProcessCloseFailure)throw new IOException("模拟远控进程仍被占用或反复重启");
+            foreach(string product in targets)RunningClients.Remove(product);
+        }
         public void SetDevice(Device d,bool enabled)
         {
             Calls.Add((enabled?"enable:":"disable:")+d.InstanceId);
@@ -162,6 +171,8 @@ namespace RemoteDriverSwitch
         {
             var results=new List<string>();
             Action<string,Action> test=(name,action)=>{try{action();results.Add("PASS "+name);}catch(Exception e){results.Add("FAIL "+name+": "+e);}};
+            UpdateDownloadTests.Register(test);
+            PortableUpdateTests.Register(test);
             test("release update compares numeric versions and skips older or current releases",()=>{
                 const string response="{\"tag_name\":\"v1.1.10\",\"draft\":false,\"prerelease\":false}";
                 Check(ReleaseUpdates.Parse(response,new Version(1,1,9,0))==new Version(1,1,10),"newer release was missed");
@@ -263,6 +274,51 @@ namespace RemoteDriverSwitch
                 Check(engine.ConfigurationDrift(restored).Count==0,"restored startup value caused a false recovery verification failure");
                 p.StartupValues.Clear();
                 Check(engine.ConfigurationDrift(restored).Count>0,"missing startup value was hidden from recovery verification");
+            });
+            test("postboot startup repair is skipped on the same boot and for a client alone",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var snapshot=engine.Protect();
+                var uu=UuStartup();p.StartupValues.Add(uu);p.RunningClients.Add("uu");p.Calls.Clear();
+                Check(!engine.RepairStartupAfterReboot(snapshot,ScanResult.Capture(p)),"same-boot scan triggered automatic repair");
+                Check(p.ReadStartup(uu)!=null&&p.RunningClients.Contains("uu")&&p.Calls.Count==0,"same-boot scan changed startup state or stopped a process");
+                p.BootId="boot-2";p.StartupValues.Clear();
+                Check(!engine.RepairStartupAfterReboot(snapshot,ScanResult.Capture(p)),"a running client alone triggered automatic repair");
+                Check(p.RunningClients.Contains("uu")&&p.Calls.Count==0&&store.State.Startups.Count==0,"automatic repair acted without a verified Run entry");
+            });
+            test("first postboot startup repair upgrades a backup without changing its original boot",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var snapshot=engine.Protect();
+                Check(snapshot.Version==1,"fixture is expected to start without startup records");
+                var uu=UuStartup();p.BootId="boot-2";p.StartupValues.Add(uu);p.Calls.Clear();
+                Check(engine.RepairStartupAfterReboot(snapshot,ScanResult.Capture(p)),"verified login value was not handled on an older backup");
+                Check(store.Load().Version==2&&store.Load().AppliedBoot=="boot-1"&&store.Load().Startups.Single().Command==uu.Command,"postboot repair did not preserve the boot baseline and migrate the backup format");
+                Check(p.ReadStartup(uu)==null,"first postboot repair left the login value enabled");
+            });
+            test("postboot startup repair preserves original records, scopes process close, and leaves the drivers alone",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var original=UuStartup();p.StartupValues.Add(original);var snapshot=engine.Protect();
+                p.BootId="boot-2";foreach(var service in p.Services.Values)service.Running=false;
+                var extra=UuStartup("GameViewerTray");
+                p.StartupValues.Add(original);p.StartupValues.Add(extra);
+                p.RunningClients.UnionWith(new[]{"uu","td","oray"});p.Calls.Clear();
+                p.BeforeStartupChange=(entry,enabled)=>{
+                    if(!enabled)Check(store.Load().Startups.Any(saved=>saved.Name==entry.Name&&saved.Command==entry.Command&&saved.Kind==entry.Kind),"postboot repair removed a Run entry before recording it");
+                };
+                p.ClosingRemoteProcesses=()=>p.StartupValues.Add(extra);
+                Check(engine.RepairStartupAfterReboot(snapshot,ScanResult.Capture(p)),"confirmed postboot startup entries were not repaired");
+                Check(p.ReadStartup(original)==null&&p.ReadStartup(extra)==null,"postboot repair did not remove a recreated startup entry after process exit");
+                Check(p.Calls.All(c=>c.StartsWith("startup:")||c=="close-processes:uu")&&p.Calls.Contains("close-processes:uu"),"postboot repair touched drivers/services or closed other products");
+                Check(!p.RunningClients.Contains("uu")&&p.RunningClients.SetEquals(new[]{"td","oray"})&&p.Reboots==0,"postboot repair stopped unrelated clients or rebooted");
+                Check(store.State.CreatedUtc==snapshot.CreatedUtc&&store.State.AppliedBoot=="boot-1"&&store.State.Startups.Count==2&&store.State.Startups.Any(entry=>entry.Name==original.Name&&entry.Command==original.Command),"postboot repair replaced the original baseline or lost the original Run record");
+            });
+            test("postboot startup repair preserves a conflicting same-name Run value and its original backup",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var original=UuStartup();p.StartupValues.Add(original);var snapshot=engine.Protect();
+                var replacement=UuStartup();replacement.Command+=" --new-arguments";
+                p.BootId="boot-2";p.StartupValues.Add(replacement);p.RunningClients.Add("uu");p.Calls.Clear();
+                Throws(()=>engine.RepairStartupAfterReboot(snapshot,ScanResult.Capture(p)),"conflicting startup metadata did not raise a repair error");
+                Check(p.ReadStartup(original).Command==replacement.Command&&store.State.Startups.Single().Command==original.Command,"postboot repair overwrote the replacement or original backup");
+                Check(p.Calls.Count==0&&p.RunningClients.Contains("uu")&&p.Reboots==0,"postboot repair touched the system despite an ambiguous Run value");
             });
             test("a remote client running after reboot prevents a clean game mode result",()=>{
                 var platform=new FakePlatform();var engine=new SwitchEngine(platform,new MemoryStore());var snapshot=engine.Protect();
@@ -398,6 +454,13 @@ namespace RemoteDriverSwitch
             test("new active remote instance after protection is reported",()=>{var p=new FakePlatform();var e=new SwitchEngine(p,new MemoryStore());var snapshot=e.Protect();p.BootId="boot-2";foreach(var service in p.Services.Values)service.Running=false;p.Items.RemoveAll(d=>d.InstanceId=="SIM\\uu-display");p.AddProfile("uu-display","ROOT\\DISPLAY\\NEW-INSTANCE");Check(e.ConfigurationDrift(snapshot).Any(d=>d.Contains(Catalog.Find("uu-display").Name)),"new active virtual display instance bypassed post-reboot verification");});
             test("restore starts original app before waiting for virtual mouse child",()=>{var p=new FakePlatform {HideFilterUntilServiceRuns=true};var e=new SwitchEngine(p,new MemoryStore());e.Protect();e.Restore();Check(p.Services["GameViewerService"].Running,"original service not running");Check(p.Items.All(d=>!d.Disabled),"virtual child restoration incomplete");});
             test("startup inventory enumerates once and makes no changes",()=>{var p=new FakePlatform();var scan=ScanResult.Capture(p);Check(p.DeviceScans==1&&p.SoftwareScans==1,"scan performed duplicate device or software enumeration");Check(scan.Devices.Count==7&&scan.Software.Count==3,"scan lost installed components");Check(scan.Services.Count==p.Services.Count&&scan.BootId==p.BootId,"scan omitted service or boot status");Check(p.Calls.Count==0&&p.Reboots==0,"inventory mutated the system");});
+            test("automatic remote process closure only accepts the current Windows session",()=>{
+                using(var process=Process.GetCurrentProcess()) {
+                    Check(RemoteProcessController.SessionMatches(process.SessionId,process),"same login session was rejected");
+                    Check(!RemoteProcessController.SessionMatches(process.SessionId==0?1:0,process),"different login session was accepted");
+                }
+                Check(RemoteProcessController.SessionMatches(null,null),"manual closure gained a session restriction");
+            });
             test("remote process roots reject broad or relative installation paths",()=>{Check(RemoteProcessRules.NormalizeRoot("D:\\")==null&&RemoteProcessRules.NormalizeRoot("relative\\UU")==null&&RemoteProcessRules.NormalizeRoot(Environment.SystemDirectory)==null,"broad or relative path accepted as a remote install root");Check(RemoteProcessRules.NormalizeRoot("E:\\Tools\\UU Remote\\")!=null,"portable dedicated installation directory rejected");});
             test("remote process path checks enforce directory boundaries",()=>{const string root="D:\\Apps\\ToDesk";Check(RemoteProcessRules.IsUnderRoot(root+"\\ToDesk.exe",root),"normal executable under installation root rejected");Check(!RemoteProcessRules.IsUnderRoot("D:\\Apps\\ToDeskBackup\\ToDesk.exe",root)&&!RemoteProcessRules.IsUnderRoot(root+"\\..\\Other\\ToDesk.exe",root),"sibling or parent traversal path escaped installation boundary");});
             test("remote process closing requires matching installation root and file identity",()=>{var roots=new[]{new RemoteInstallRoot {ProductId="uu",Path="E:\\Remote Apps\\UU"}};var valid=new RemoteProcessInfo {Id=42,ProductId="uu",Name="GameViewer",ExecutablePath="E:\\Remote Apps\\UU\\GameViewer.exe",StartTimeUtc="2026-11-05T12:00:00.0000000Z",Company="Netease",ProductName="GameViewer",OriginalFileName="GameViewer.exe"};Check(RemoteProcessRules.CanClose(valid,roots),"verified vendor binary at portable install path rejected");valid.ExecutablePath="E:\\Other Apps\\GameViewer.exe";Check(!RemoteProcessRules.CanClose(valid,roots),"same-name process outside installation root accepted");valid.ExecutablePath="E:\\Remote Apps\\UU\\Notes.exe";valid.Name="Notes";valid.OriginalFileName="Notes.exe";valid.Company="Other Vendor";valid.ProductName="Text Editor";Check(!RemoteProcessRules.CanClose(valid,roots),"unrelated binary inside installation directory accepted");valid.ProductId="oray";valid.Name="AweSun";valid.ExecutablePath="E:\\Remote Apps\\UU\\AweSun.exe";valid.Company="Oray";valid.ProductName="AweSun";Check(!RemoteProcessRules.CanClose(valid,roots),"another product reused a trusted installation root");});
