@@ -97,7 +97,7 @@ namespace RemoteDriverSwitch
         {
             if(record==null||scan==null||!Ready(record,scan.BootId))throw new InvalidOperationException("尚未完成重启，保留自动启动核验任务。");
             if(snapshot!=null&&snapshot.PendingDevices.Count>0)throw new InvalidOperationException("设备恢复尚未完成，保留重启后的继续恢复任务。");
-            WriteJson(Path.Combine(root,"last-verification.json"),new {CheckedAt=DateTime.UtcNow.ToString("o"),Expected=record,CurrentPhase=snapshot==null?null:snapshot.Phase,scan.BootId,scan.ComputerName,scan.OsDescription,GoalMatches=GoalMatches(record,snapshot),Differences=differences,Warnings=scan.Warnings,Devices=scan.Devices,Services=scan.Services});
+            WriteJson(Path.Combine(root,"last-verification.json"),new {CheckedAt=DateTime.UtcNow.ToString("o"),Expected=record,CurrentPhase=snapshot==null?null:snapshot.Phase,scan.BootId,scan.ComputerName,scan.OsDescription,GoalMatches=GoalMatches(record,snapshot),Differences=differences,Warnings=scan.Warnings,Devices=scan.Devices,Services=scan.Services,StartupEntries=scan.Startups.ConvertAll(entry=>new {entry.ProductId,entry.Scope,entry.View,entry.Name})});
             Remove(record.UserSid);File.Delete(PendingPath);
         }
     }

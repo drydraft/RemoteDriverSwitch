@@ -99,6 +99,7 @@ namespace RemoteDriverSwitch
         public List<DeviceRecord> Devices = new List<DeviceRecord>();
         public List<ServiceState> Drivers = new List<ServiceState>();
         public List<ServiceState> Apps = new List<ServiceState>();
+        public List<StartupEntry> Startups = new List<StartupEntry>();
         public List<string> PendingDevices = new List<string>();
     }
     public interface IPlatform
@@ -113,6 +114,9 @@ namespace RemoteDriverSwitch
         void StopApp(string name);
         void StartApp(string name);
         void CloseRemoteProcesses();
+        List<StartupEntry> StartupEntries();
+        StartupEntry ReadStartup(StartupEntry entry);
+        void SetStartup(StartupEntry entry,bool enabled);
         void SetDevice(Device device, bool enabled);
         void Reboot();
     }
@@ -206,6 +210,17 @@ namespace RemoteDriverSwitch
                 if(service==null||service.Start!=wanted||!string.Equals(service.ImagePath,original.ImagePath,StringComparison.OrdinalIgnoreCase))drift.Add(original.Name);
                 if(protecting&&rebooted&&service!=null&&service.Running)drift.Add(original.Name);
             }
+            foreach(var startup in s.Startups) {
+                try {
+                    var currentStartup=platform.ReadStartup(startup);
+                    if(protecting?currentStartup!=null:!startup.Matches(currentStartup))drift.Add(StartupLabel(startup));
+                }catch(Exception error){drift.Add(StartupLabel(startup)+"（"+error.Message+"）");}
+            }
+            if(protecting) {
+                foreach(var startup in scan.Startups)drift.Add(StartupLabel(startup));
+                if(rebooted)foreach(var app in scan.Software.Where(app=>app.ProcessRunning))
+                    drift.Add(app.Name+"程序进程仍在运行");
+            }
             foreach(var record in s.Devices) {
                 if(!protecting&&!rebooted&&s.PendingDevices.Contains(record.InstanceId,StringComparer.OrdinalIgnoreCase))continue;
                 var device=current.FirstOrDefault(d=>string.Equals(d.InstanceId,ActiveId(record),StringComparison.OrdinalIgnoreCase));
@@ -253,8 +268,9 @@ namespace RemoteDriverSwitch
         }
         private void Validate(Snapshot s)
         {
-            if(s==null||s.Version!=1||s.MachineId!=platform.MachineId||s.Devices==null||s.Drivers==null||s.Apps==null||s.PendingDevices==null||
-               s.Devices.Count>128||s.Drivers.Count>Catalog.DriverNames.Count()||s.Apps.Count>Catalog.AppServices.Count ||
+            if(s==null||(s.Version!=1&&s.Version!=2)||s.MachineId!=platform.MachineId||s.Devices==null||s.Drivers==null||s.Apps==null||s.Startups==null||s.PendingDevices==null||
+               (s.Version==1&&s.Startups.Count>0)||
+               s.Devices.Count>128||s.Drivers.Count>Catalog.DriverNames.Count()||s.Apps.Count>Catalog.AppServices.Count||s.Startups.Count>64||
                !(new[]{"Preparing","Protected","Restoring","Restored","RecoveryRequired"}).Contains(s.Phase))
                 throw new InvalidDataException("备份格式或电脑身份不匹配，未执行切换。");
             if(s.PendingDevices.Count>s.Devices.Count||s.PendingDevices.Distinct(StringComparer.OrdinalIgnoreCase).Count()!=s.PendingDevices.Count||s.PendingDevices.Any(id=>!s.Devices.Any(d=>string.Equals(d.InstanceId,id,StringComparison.OrdinalIgnoreCase))))throw new InvalidDataException("待恢复设备记录与原始备份不一致。");
@@ -268,16 +284,19 @@ namespace RemoteDriverSwitch
                 if(string.IsNullOrWhiteSpace(record.CurrentInstanceId)||record.OriginallyDisabled||s.Devices.Count(r=>r.TargetId==record.TargetId)!=1||s.Devices.Any(r=>r!=record&&string.Equals(r.InstanceId,record.CurrentInstanceId,StringComparison.OrdinalIgnoreCase))||!s.Devices.Any(r=>string.Equals(r.InstanceId,record.ParentId,StringComparison.OrdinalIgnoreCase)))throw new InvalidDataException("重新生成的设备缺少唯一身份或受管父级证据。");
             foreach(var x in s.Drivers)CheckService(x,false);
             foreach(var x in s.Apps)CheckService(x,true);
+            foreach(var startup in s.Startups)WindowsStartup.Validate(startup);
+            if(s.Startups.Select(startup=>startup.Identity).Distinct(StringComparer.OrdinalIgnoreCase).Count()!=s.Startups.Count)
+                throw new InvalidDataException("备份中有重复的登录启动项。");
             foreach(var record in s.Devices.Where(r=>r.DriverOnly)) {
                 var names=Catalog.Find(record.TargetId).DriverServices.ToList();
                 if(names.Count==0||names.Any(name=>!s.Drivers.Any(d=>string.Equals(d.Name,name,StringComparison.OrdinalIgnoreCase))))
                     throw new InvalidDataException("重启后停用的设备缺少专用驱动备份："+record.TargetId);
             }
         }
-        private Snapshot Capture()
+        private Snapshot Capture(List<StartupEntry> startups)
         {
             var found=platform.Devices();
-            var s=new Snapshot { MachineId=platform.MachineId,CreatedUtc=DateTime.UtcNow.ToString("o"),AppliedBoot=platform.BootId,Phase="Preparing" };
+            var s=new Snapshot { Version=startups.Count>0?2:1,MachineId=platform.MachineId,CreatedUtc=DateTime.UtcNow.ToString("o"),AppliedBoot=platform.BootId,Phase="Preparing",Startups=startups };
             foreach(var t in Catalog.Targets) {
                 var devices=found.Where(t.Matches).ToList();
                 if(devices.Count>8)throw new InvalidDataException("同类设备过多，请核对："+t.Name);
@@ -295,7 +314,7 @@ namespace RemoteDriverSwitch
                 var names=Catalog.Find(record.TargetId).DriverServices.ToList();
                 record.DriverOnly=!record.OriginallyDisabled&&(device.RawStatus&8)!=0&&(device.RawStatus&0x2000)==0&&names.Count>0&&names.All(name=>s.Drivers.Any(d=>string.Equals(d.Name,name,StringComparison.OrdinalIgnoreCase)));
             }
-            if(s.Devices.Count==0&&s.Apps.Count==0)throw new InvalidOperationException("扫描未发现可切换的远控设备或服务。");
+            if(s.Devices.Count==0&&s.Apps.Count==0&&s.Startups.Count==0)throw new InvalidOperationException("扫描未发现可切换的远控设备、服务或登录启动项。");
             Validate(s);return s;
         }
         private Device Locate(DeviceRecord record,Snapshot snapshot,List<Device> knownDevices=null)
@@ -371,6 +390,29 @@ namespace RemoteDriverSwitch
             var result=platform.Service(original.Name);
             if(result==null||result.Start!=start)throw new IOException("启动配置写入后验证失败："+original.Name);
         }
+        private static string StartupLabel(StartupEntry entry)
+        {return "登录启动项 "+entry.Name+"（"+(entry.Scope=="User"?"当前账户":"电脑 "+entry.View+" 位")+"）";}
+        private StartupEntry VerifyStartupSlot(StartupEntry startup)
+        {
+            var current=platform.ReadStartup(startup);
+            if(current!=null&&!startup.Matches(current))throw new IOException(StartupLabel(startup)+"与原备份不同，请先核对。");
+            return current;
+        }
+        private void SuppressStartup(StartupEntry startup)
+        {
+            if(VerifyStartupSlot(startup)==null)return;
+            platform.SetStartup(startup,false);
+            Note("已停用"+StartupLabel(startup));
+        }
+        private void RestoreStartups(List<StartupEntry> startups,List<string> failures)
+        {
+            foreach(var startup in startups) {
+                try {
+                    platform.SetStartup(startup,true);
+                    Note("已恢复"+StartupLabel(startup));
+                }catch(Exception error){failures.Add(StartupLabel(startup)+"恢复未完成："+error.Message);}
+            }
+        }
         public Snapshot Protect()
         {
             platform.EnsureReady();
@@ -380,7 +422,16 @@ namespace RemoteDriverSwitch
             if(previous!=null&&previous.PendingDevices.Count>0)throw new InvalidOperationException("上次恢复还有待完成的设备，请先完成恢复和重启核验。");
             if(previous!=null&&previous.Phase=="Restored"&&previous.AppliedBoot==platform.BootId&&!CanProtect(previous,ScanResult.Capture(platform)))
                 throw new InvalidOperationException("恢复后的运行状态尚未回到原始配置，请先完成重启，再进入下一次游戏模式。");
-            var s=previous!=null&&previous.Phase=="Protected"?previous:Capture();
+            var startups=platform.StartupEntries();
+            var s=previous!=null&&previous.Phase=="Protected"?previous:Capture(startups);
+            if(s==previous)foreach(var startup in startups) {
+                var original=s.Startups.FirstOrDefault(entry=>StringComparer.OrdinalIgnoreCase.Equals(entry.Identity,startup.Identity));
+                if(original==null)s.Startups.Add(startup);
+                else if(!original.Matches(startup))throw new IOException(StartupLabel(startup)+"与原备份不同，请先核对。");
+            }
+            if(s.Startups.Count>0)s.Version=2;
+            Validate(s);
+            var presentStartups=s.Startups.Where(startup=>VerifyStartupSlot(startup)!=null).ToList();
             foreach(var record in s.Devices)Locate(record,s);
             var appsBeforeAttempt=s.Apps.Select(app=>platform.Service(app.Name)).ToList();
             foreach(var app in appsBeforeAttempt){if(app==null)throw new InvalidOperationException("远控服务在切换前已变化，请重新扫描。");CheckService(app,true);}
@@ -388,12 +439,16 @@ namespace RemoteDriverSwitch
             // The original snapshot must be durable before the first system change.
             store.Save(s);
             try {
+                foreach(var startup in s.Startups)SuppressStartup(startup);
                 foreach(var app in s.Apps)StartValue(app,4,true);
                 foreach(var app in s.Apps) {
                     if(platform.Service(app.Name).Running){Note("停止远控服务："+app.Name);platform.StopApp(app.Name);}
                 }
                 Note("关闭 UU、ToDesk 和向日葵的后台进程，并确认退出。");
                 platform.CloseRemoteProcesses();
+                foreach(var startup in s.Startups)SuppressStartup(startup);
+                var outstanding=platform.StartupEntries();
+                if(outstanding.Count>0)throw new IOException("退出后仍发现远控登录启动项，请重新扫描："+string.Join("、",outstanding.Select(StartupLabel)));
                 Note("远控后台进程检查完成，开始处理驱动。");
                 driverStage=true;
                 foreach(var d in s.Drivers)StartValue(d,4,false);
@@ -416,11 +471,16 @@ namespace RemoteDriverSwitch
                 try {
                     if(driverStage)RestoreInternal(s,true);
                     else {
-                        foreach(var app in appsBeforeAttempt)StartValue(app,app.Start,true);
-                        foreach(var app in appsBeforeAttempt)if(!app.Running&&platform.Service(app.Name).Running)platform.StopApp(app.Name);
-                        foreach(var app in appsBeforeAttempt)if(app.Running&&app.Start!=4&&!platform.Service(app.Name).Running)platform.StartApp(app.Name);
+                        var failures=new List<string>();
+                        try {
+                            foreach(var app in appsBeforeAttempt)StartValue(app,app.Start,true);
+                            foreach(var app in appsBeforeAttempt)if(!app.Running&&platform.Service(app.Name).Running)platform.StopApp(app.Name);
+                            foreach(var app in appsBeforeAttempt)if(app.Running&&app.Start!=4&&!platform.Service(app.Name).Running)platform.StartApp(app.Name);
+                        }catch(Exception rollback){failures.Add(rollback.Message);}
+                        RestoreStartups(presentStartups,failures);
+                        if(failures.Count>0)throw new IOException(string.Join("；",failures));
                         s.Phase=phaseBeforeAttempt=="Protected"?"Protected":"Restored";store.Save(s);
-                        Note("驱动阶段尚未开始；已恢复本次操作前的远控服务配置。");
+                        Note("驱动阶段尚未开始；已恢复本次操作前的登录启动项和远控服务配置。");
                     }
                 }
                 catch(Exception rollback) {s.Phase="RecoveryRequired";store.Save(s);Note("回退未完成："+rollback.Message);}
@@ -491,6 +551,8 @@ namespace RemoteDriverSwitch
                 if(device==null)throw new InvalidOperationException(Catalog.Find(record.TargetId).Name+"尚未重新枚举，请重启后再次恢复。原始备份仍保留。");
                 if(device.Disabled!=record.OriginallyDisabled){Note((record.OriginallyDisabled?"恢复原禁用状态：":"启用设备：")+Catalog.Find(record.TargetId).Name);platform.SetDevice(device,!record.OriginallyDisabled);if(device.RebootRequired)Pending(s,record);}
             }
+            RestoreStartups(s.Startups,failures);
+            if(failures.Count>0)throw new IOException(string.Join("；",failures));
             s.Phase="Restored";s.AppliedBoot=platform.BootId;store.Save(s);
             Note(s.PendingDevices.Count==0?"原始配置已恢复，重启后按原启动方式加载。":"恢复配置已保存，重启后继续处理 "+s.PendingDevices.Count+" 个设备并核验。");
         }

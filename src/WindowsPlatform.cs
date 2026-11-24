@@ -106,6 +106,9 @@ namespace RemoteDriverSwitch
         }
         public void CloseRemoteProcesses()
         {new RemoteProcessController(this,Trace).Close();}
+        public List<StartupEntry> StartupEntries(){return WindowsStartup.Read();}
+        public StartupEntry ReadStartup(StartupEntry entry){return WindowsStartup.ReadSlot(entry);}
+        public void SetStartup(StartupEntry entry,bool enabled){WindowsStartup.SetEnabled(entry,enabled);}
         public static string Quote(string value)
         {
             if(value==null||value.IndexOfAny(new[]{'"','\r','\n','\0'})>=0||value.EndsWith("\\"))throw new ArgumentException("设备标识包含无效字符。");

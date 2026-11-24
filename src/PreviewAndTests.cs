@@ -24,6 +24,9 @@ namespace RemoteDriverSwitch
         public List<Device> Items=new List<Device>();
         public Dictionary<string,ServiceState> Services=new Dictionary<string,ServiceState>(StringComparer.OrdinalIgnoreCase);
         public List<string> Calls=new List<string>();
+        public readonly List<StartupEntry> StartupValues=new List<StartupEntry>();
+        public Action<StartupEntry,bool> BeforeStartupChange;
+        public Action ClosingRemoteProcesses;
         public static readonly string[] DefaultTargetIds={"uu-hid","uu-filter","uu-display","oray-usb","oray-gamepad","oray-display","td-audio"};
         public string FailOnDevice,ProcessCloseHideTarget,FailOnAppStart;public bool FailOnce=true,Pending,Busy,RebootFail,HideFilterUntilServiceRuns,HideChildrenWithDisabledParent,ProcessCloseFailure,HideFilterUntilDriverRuns,FailAppStartUntilDriverLoaded;
         public int Reboots,DeviceScans,ServiceReads,SoftwareScans;
@@ -82,7 +85,40 @@ namespace RemoteDriverSwitch
         public void SetStart(string name,int start){Calls.Add("start:"+name+":"+start);Services[name].Start=start;}
         public void StopApp(string name){Calls.Add("stop:"+name);Services[name].Running=false;}
         public void StartApp(string name){Calls.Add("run:"+name);if(name==FailOnAppStart)throw new IOException("模拟远控服务启动失败");if(FailAppStartUntilDriverLoaded&&name=="GameViewerService"&&!Services["uuycinput"].Running)throw new IOException("模拟远控服务依赖尚未重新加载的驱动");Services[name].Running=true;}
-        public void CloseRemoteProcesses(){Calls.Add("close-processes");if(ProcessCloseHideTarget!=null)Items.RemoveAll(d=>d.InstanceId==ProcessCloseHideTarget);if(ProcessCloseFailure)throw new IOException("模拟远控进程仍被占用或反复重启");}
+        private static bool SameStartupSlot(StartupEntry first,StartupEntry second)
+        {
+            return first.Scope==second.Scope&&first.View==second.View&&
+                string.Equals(first.UserSid,second.UserSid,StringComparison.OrdinalIgnoreCase)&&
+                string.Equals(first.Name,second.Name,StringComparison.OrdinalIgnoreCase);
+        }
+        private static StartupEntry CopyStartup(StartupEntry entry)
+        {
+            return new StartupEntry {
+                Scope=entry.Scope,View=entry.View,UserSid=entry.UserSid,Name=entry.Name,
+                Command=entry.Command,ProductId=entry.ProductId,Kind=entry.Kind
+            };
+        }
+        public List<StartupEntry> StartupEntries()
+        {
+            return StartupValues.Where(entry=>entry.ProductId=="uu"||entry.ProductId=="td"||entry.ProductId=="oray").Select(CopyStartup).ToList();
+        }
+        public StartupEntry ReadStartup(StartupEntry entry)
+        {
+            var current=StartupValues.SingleOrDefault(value=>SameStartupSlot(value,entry));
+            if(current==null)return null;
+            var raw=CopyStartup(current);raw.ProductId=null;return raw;
+        }
+        public void SetStartup(StartupEntry entry,bool enabled)
+        {
+            if(BeforeStartupChange!=null)BeforeStartupChange(entry,enabled);
+            var current=ReadStartup(entry);
+            if(current!=null&&(current.Kind!=entry.Kind||current.Command!=entry.Command))
+                throw new IOException("模拟启动项内容已变化");
+            Calls.Add("startup:"+entry.Name+":"+enabled);
+            if(enabled&&current==null)StartupValues.Add(CopyStartup(entry));
+            if(!enabled&&current!=null)StartupValues.RemoveAll(value=>SameStartupSlot(value,entry));
+        }
+        public void CloseRemoteProcesses(){Calls.Add("close-processes");if(ClosingRemoteProcesses!=null)ClosingRemoteProcesses();if(ProcessCloseHideTarget!=null)Items.RemoveAll(d=>d.InstanceId==ProcessCloseHideTarget);if(ProcessCloseFailure)throw new IOException("模拟远控进程仍被占用或反复重启");}
         public void SetDevice(Device d,bool enabled)
         {
             Calls.Add((enabled?"enable:":"disable:")+d.InstanceId);
@@ -98,6 +134,13 @@ namespace RemoteDriverSwitch
     {
         private static void Check(bool condition,string text){if(!condition)throw new Exception(text);}
         private static void Throws(Action action,string text){bool thrown=false;try{action();}catch{thrown=true;}Check(thrown,text);}
+        private static StartupEntry UuStartup(string name="GameViewer")
+        {
+            return new StartupEntry {
+                Scope="User",View=64,UserSid="S-1-5-21-111-222-333-1001",Name=name,ProductId="uu",
+                Command="\"%ProgramFiles%\\Sample Apps\\UU\\GameViewer.exe\" --autostart",Kind=(int)Microsoft.Win32.RegistryValueKind.ExpandString
+            };
+        }
         private static FakePlatform OfflineProtectedUu(out MemoryStore store,out SwitchEngine engine)
         {
             var platform=new FakePlatform {HideFilterUntilDriverRuns=true};
@@ -119,9 +162,132 @@ namespace RemoteDriverSwitch
         {
             var results=new List<string>();
             Action<string,Action> test=(name,action)=>{try{action();results.Add("PASS "+name);}catch(Exception e){results.Add("FAIL "+name+": "+e);}};
+            test("release update compares numeric versions and skips older or current releases",()=>{
+                const string response="{\"tag_name\":\"v1.1.10\",\"draft\":false,\"prerelease\":false}";
+                Check(ReleaseUpdates.Parse(response,new Version(1,1,9,0))==new Version(1,1,10),"newer release was missed");
+                Check(ReleaseUpdates.Parse(response,new Version(1,1,10,0))==null,"current release was offered as an update");
+                Check(ReleaseUpdates.Parse(response,new Version(1,2,0,0))==null,"older release was offered as an update");
+            });
+            test("release update ignores drafts and prereleases",()=>{
+                var installed=new Version(1,1,6,0);
+                Check(ReleaseUpdates.Parse("{\"tag_name\":\"v1.2.0\",\"draft\":true,\"prerelease\":false}",installed)==null,"draft was offered as an update");
+                Check(ReleaseUpdates.Parse("{\"tag_name\":\"v1.2.0-rc.1\",\"draft\":false,\"prerelease\":true}",installed)==null,"prerelease was offered as an update");
+            });
+            test("release update rejects invalid metadata and uses the official release page",()=>{
+                var installed=new Version(1,1,6,0);
+                Throws(()=>ReleaseUpdates.Parse("{\"tag_name\":\"v01.2.0\",\"draft\":false,\"prerelease\":false}",installed),"noncanonical tag was accepted");
+                Throws(()=>ReleaseUpdates.Parse("{\"tag_name\":\"v1.2.0\",\"draft\":\"false\",\"prerelease\":false}",installed),"untyped release flag was accepted");
+                var release=ReleaseUpdates.Parse("{\"tag_name\":\"v1.2.0\",\"draft\":false,\"prerelease\":false,\"html_url\":\"https://example.invalid\"}",installed);
+                Check(ReleaseUpdates.Page(release)=="https://github.com/drydraft/RemoteDriverSwitch/releases/tag/v1.2.0","release page did not use the official repository and verified tag");
+            });
             test("seven-target exact identity",()=>{var p=new FakePlatform();Check(p.Items.Count==7&&Catalog.Targets.Where(t=>FakePlatform.DefaultTargetIds.Contains(t.Id)).All(t=>p.Items.Count(t.Matches)==1),"default target identity mismatch");Check(Catalog.Targets.Where(t=>!FakePlatform.DefaultTargetIds.Contains(t.Id)).All(t=>!p.Items.Any(t.Matches)),"uninstalled profiles appeared in simulation");Check(p.Services.Keys.Count(k=>Catalog.DriverNames.Contains(k,StringComparer.OrdinalIgnoreCase))==5,"shared system services must not be modified");});
             test("protect and restore preserve baseline",()=>{var p=new FakePlatform();var s=new MemoryStore();var e=new SwitchEngine(p,s);p.Items.Single(d=>d.InstanceId=="SIM\\oray-gamepad").Disabled=true;e.Protect();Check(p.Items.All(d=>d.Disabled),"not all disabled");Check(p.Services.Values.All(v=>v.Start==4),"not all starts disabled");e.Restore();Check(p.Items.Where(d=>d.InstanceId!="SIM\\oray-gamepad").All(d=>!d.Disabled),"enabled state not restored");Check(p.Items.Single(d=>d.InstanceId=="SIM\\oray-gamepad").Disabled,"previously disabled device was enabled");Check(p.Services["OrayVGC"].Start==1&&p.Services["uuycinput"].Start==3&&p.Services["GameViewerService"].Start==2,"start values not restored");});
             test("remote services and processes close before any driver changes",()=>{var p=new FakePlatform();foreach(string name in Catalog.AppServices.Keys)p.Services[name].Running=true;var store=new MemoryStore();new SwitchEngine(p,store).Protect();int close=p.Calls.IndexOf("close-processes");Check(close>=0,"remote process close phase missing");foreach(string name in Catalog.AppServices.Keys){Check(p.Calls.IndexOf("start:"+name+":4")>=0&&p.Calls.IndexOf("start:"+name+":4")<close,"remote service can relaunch processes during close: "+name);Check(p.Calls.IndexOf("stop:"+name)>=0&&p.Calls.IndexOf("stop:"+name)<close,"running service not stopped before process close: "+name);}Check(p.Calls.Where(c=>Catalog.DriverNames.Any(n=>c=="start:"+n+":4")||c.StartsWith("disable:")).All(c=>p.Calls.IndexOf(c)>close),"driver or device modified before process close completed");Check(store.State.Apps.All(a=>a.Running),"original running service baseline was captured after service stop");});
+            test("protect saves remote startup values before suppressing them and restores the original data",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var uu=UuStartup();
+                var other=new StartupEntry {Scope=uu.Scope,View=uu.View,UserSid=uu.UserSid,Name="UnrelatedApp",Command="C:\\Sample\\Unrelated.exe",Kind=(int)Microsoft.Win32.RegistryValueKind.String};
+                p.StartupValues.AddRange(new[]{uu,other});
+                p.BeforeStartupChange=(entry,enabled)=>{
+                    if(!enabled)Check(store.Load().Startups.Any(value=>value.Name==entry.Name&&value.Command==entry.Command&&value.Kind==entry.Kind),"startup data was not durable before removing its Run value");
+                };
+                engine.Protect();
+                int removed=p.Calls.IndexOf("startup:"+uu.Name+":False");
+                Check(removed>=0&&removed<p.Calls.IndexOf("start:uuycinput:4"),"remote startup value was not removed before the driver phase");
+                Check(p.ReadStartup(uu)==null&&p.ReadStartup(other).Command==other.Command,"game mode retained a remote startup entry or removed an unrelated entry");
+                engine.Restore();
+                var restored=p.ReadStartup(uu);
+                Check(restored!=null&&restored.Scope==uu.Scope&&restored.View==uu.View&&restored.UserSid==uu.UserSid&&restored.Command==uu.Command&&restored.Kind==uu.Kind,"restore lost original startup scope, raw command, or registry type");
+                Check(p.ReadStartup(other).Command==other.Command,"restore replaced an unrelated entry");
+            });
+            test("protected snapshot can add remote startup values on reapply without replacing the original baseline",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var original=engine.Protect();
+                store.State.Version=1;
+                var first=UuStartup();p.StartupValues.Add(first);
+                var firstReapply=engine.Protect();
+                Check(firstReapply.Startups.Count==1&&p.ReadStartup(first)==null,"older protected snapshot missed a new startup value");
+                Check(firstReapply.Version==2&&store.State.Version==2,"version 1 backup was not migrated when startup data was added");
+                var second=UuStartup("GameViewerTray");p.StartupValues.Add(second);
+                var secondReapply=engine.Protect();
+                Check(secondReapply.CreatedUtc==original.CreatedUtc&&secondReapply.Drivers.Single(d=>d.Name=="uuycinput").Start==3,"reapply replaced the original driver baseline");
+                Check(secondReapply.Startups.Count==2&&p.ReadStartup(second)==null,"reapply lost an earlier startup backup or left a newly found value enabled");
+                engine.Restore();
+                Check(p.ReadStartup(first).Command==first.Command&&p.ReadStartup(second).Command==second.Command,"reapplied game mode could not restore both startup values");
+            });
+            test("startup value recreated during client exit is suppressed again before driver changes",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);var uu=UuStartup();p.StartupValues.Add(uu);
+                p.ClosingRemoteProcesses=()=>p.StartupValues.Add(uu);
+                engine.Protect();
+                string removal="startup:"+uu.Name+":False";
+                Check(p.Calls.Count(c=>c==removal)==2&&p.Calls.IndexOf("close-processes")<p.Calls.LastIndexOf(removal),"shutdown recreated a login value that was never rechecked");
+                Check(p.Calls.LastIndexOf(removal)<p.Calls.IndexOf("start:uuycinput:4")&&p.ReadStartup(uu)==null,"driver stage started while the recreated login value was present");
+                Check(store.State.Startups.Count==1,"recreated slot duplicated the recovery record");
+            });
+            test("failed first protect restores startup run values before leaving the driver state untouched",()=>{
+                var p=new FakePlatform {ProcessCloseFailure=true};var store=new MemoryStore();var engine=new SwitchEngine(p,store);var uu=UuStartup();p.StartupValues.Add(uu);
+                Throws(()=>engine.Protect(),"failed process close was ignored");
+                Check(p.Calls.Contains("startup:"+uu.Name+":False")&&p.Calls.Contains("startup:"+uu.Name+":True"),"startup value was not rolled back after the pre-driver failure");
+                Check(p.ReadStartup(uu).Command==uu.Command&&store.State.Phase=="Restored","pre-driver failure did not restore the original startup value");
+                Check(!p.Calls.Contains("start:uuycinput:4")&&p.Reboots==0,"pre-driver failure touched a driver or rebooted");
+            });
+            test("failed protected reapply preserves suppressed startup values and returns newly active ones",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var existing=UuStartup();p.StartupValues.Add(existing);engine.Protect();
+                var incoming=UuStartup("GameViewerTray");p.StartupValues.Add(incoming);p.ProcessCloseFailure=true;p.Calls.Clear();
+                Throws(()=>engine.Protect(),"failed process close during reapply was ignored");
+                Check(p.ReadStartup(existing)==null,"failed reapply changed a previously suppressed startup value");
+                Check(p.ReadStartup(incoming).Command==incoming.Command&&store.State.Phase=="Protected","failed reapply altered the previous startup state or game mode");
+                Check(p.Calls.Contains("startup:"+incoming.Name+":False")&&!p.Calls.Any(c=>c.StartsWith("disable:")||c.StartsWith("enable:")),"failed reapply skipped the startup preflight or changed device state");
+            });
+            test("startup rollback conflict does not prevent previously running remote services from recovering",()=>{
+                var p=new FakePlatform {ProcessCloseFailure=true};var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var uu=UuStartup();p.StartupValues.Add(uu);
+                var other=new StartupEntry {
+                    Scope=uu.Scope,View=uu.View,UserSid=uu.UserSid,Name=uu.Name,
+                    Command="C:\\Sample\\Unrelated.exe",Kind=(int)Microsoft.Win32.RegistryValueKind.String
+                };
+                p.ClosingRemoteProcesses=()=>p.StartupValues.Add(other);
+                Throws(()=>engine.Protect(),"pre-driver failure was ignored");
+                Check(p.ReadStartup(uu).Command==other.Command,"rollback overwrote the replacement startup value");
+                Check(p.Services["GameViewerService"].Start==2&&p.Services["GameViewerService"].Running,"startup slot conflict prevented service rollback");
+                Check(store.State.Phase=="RecoveryRequired"&&store.State.Startups.Single().Command==uu.Command&&p.Reboots==0,"rollback conflict lost its recovery data or restarted");
+            });
+            test("reboot verification reports reenabled or missing managed startup values",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);var uu=UuStartup();p.StartupValues.Add(uu);
+                var protectedState=engine.Protect();p.BootId="boot-2";foreach(var service in p.Services.Values)service.Running=false;
+                Check(engine.ConfigurationDrift(protectedState).Count==0,"suppressed startup value caused a false game mode verification failure");
+                p.StartupValues.Add(uu);
+                Check(engine.ConfigurationDrift(protectedState).Count>0,"reenabled startup value was hidden from game mode verification");
+                var restored=engine.Restore();p.BootId="boot-3";
+                Check(engine.ConfigurationDrift(restored).Count==0,"restored startup value caused a false recovery verification failure");
+                p.StartupValues.Clear();
+                Check(engine.ConfigurationDrift(restored).Count>0,"missing startup value was hidden from recovery verification");
+            });
+            test("a remote client running after reboot prevents a clean game mode result",()=>{
+                var platform=new FakePlatform();var engine=new SwitchEngine(platform,new MemoryStore());var snapshot=engine.Protect();
+                platform.BootId="boot-2";
+                foreach(var service in platform.Services.Values)service.Running=false;
+                var scan=ScanResult.Capture(platform);
+                Check(engine.ConfigurationDrift(snapshot,scan).Count==0,"closed clients should allow verification");
+                scan.Software.Single(app=>app.Id=="uu").ProcessRunning=true;
+                Check(engine.ConfigurationDrift(snapshot,scan).Any(issue=>issue.Contains("UU远程")),"restarted client was missed");
+            });
+            test("startup restore preserves a changed value that reused its backed-up slot",()=>{
+                var p=new FakePlatform();var store=new MemoryStore();var engine=new SwitchEngine(p,store);
+                var uu=UuStartup();p.StartupValues.Add(uu);engine.Protect();
+                var other=new StartupEntry {
+                    Scope=uu.Scope,View=uu.View,UserSid=uu.UserSid,Name=uu.Name,
+                    Command="C:\\Sample\\Unrelated.exe",Kind=(int)Microsoft.Win32.RegistryValueKind.String
+                };
+                p.StartupValues.Add(other);
+                Throws(()=>engine.Restore(),"conflicting startup slot was silently treated as restored");
+                Check(p.ReadStartup(uu).Command==other.Command&&p.ReadStartup(uu).Kind==other.Kind,"restore overwrote the replacement startup value");
+                Check(store.State.Phase=="RecoveryRequired"&&store.State.Startups.Single().Command==uu.Command&&p.Reboots==0,"startup slot conflict discarded the original backup or restarted");
+                p.StartupValues.Remove(other);
+                engine.Restore();
+                Check(p.ReadStartup(uu).Command==uu.Command&&store.State.Phase=="Restored","removing the conflicting startup value did not allow recovery");
+            });
             test("failed process close restores services without touching drivers",()=>{var p=new FakePlatform {ProcessCloseFailure=true};var store=new MemoryStore();var e=new SwitchEngine(p,store);Throws(()=>e.Protect(),"process close failure ignored");Check(p.Calls.Contains("close-processes"),"process closing was skipped");Check(!p.Calls.Any(c=>c.StartsWith("disable:")||c.StartsWith("enable:")||Catalog.DriverNames.Any(n=>c.StartsWith("start:"+n+":"))),"driver or device changed despite process close failure");Check(p.Services["GameViewerService"].Start==2&&p.Services["GameViewerService"].Running,"original running UU service not restored");Check(p.Services["AweSunService"].Start==3&&p.Services["ToDesk_Service"].Start==3&&store.State.Phase=="Restored","service configuration not recovered after process close failure");Check(p.Reboots==0,"process close failure caused reboot");});
             test("failed process close leaves originally stopped services stopped",()=>{var p=new FakePlatform {ProcessCloseFailure=true};p.Services["GameViewerService"].Running=false;var e=new SwitchEngine(p,new MemoryStore());Throws(()=>e.Protect(),"process close failure missing");Check(!p.Calls.Any(c=>c.StartsWith("run:"))&&Catalog.AppServices.Keys.All(n=>!p.Services[n].Running),"process close failure started an originally stopped service");Check(p.Items.All(d=>!d.Disabled)&&p.Reboots==0,"process close failure disabled devices or rebooted");});
             test("process close failure during protected reapply preserves existing game mode",()=>{var p=new FakePlatform();var store=new MemoryStore();var e=new SwitchEngine(p,store);e.Protect();p.Calls.Clear();p.ProcessCloseFailure=true;Throws(()=>e.Protect(),"reapplied process close failure ignored");Check(store.State.Phase=="Protected"&&p.Services.Values.All(s=>s.Start==4)&&p.Items.All(d=>d.Disabled),"failed process-only preflight restored an existing game configuration");Check(!p.Calls.Any(c=>c.StartsWith("disable:")||c.StartsWith("enable:")||c.StartsWith("run:")||Catalog.DriverNames.Any(n=>c.StartsWith("start:"+n+":"))),"reapply process close failure changed driver/device/runtime configuration");Check(p.Reboots==0,"failed protected reapply rebooted");});

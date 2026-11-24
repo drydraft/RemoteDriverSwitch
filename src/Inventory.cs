@@ -18,6 +18,7 @@ namespace RemoteDriverSwitch
     {
         public List<Device> Devices=new List<Device>();
         public List<SoftwareInfo> Software=new List<SoftwareInfo>();
+        public List<StartupEntry> Startups=new List<StartupEntry>();
         public Dictionary<string,ServiceState> Services=new Dictionary<string,ServiceState>(StringComparer.OrdinalIgnoreCase);
         public string OsDescription="",ComputerName="",ScannedAt="",BootId="";
         public List<string> Warnings=new List<string>();
@@ -33,6 +34,8 @@ namespace RemoteDriverSwitch
                 catch(Exception error){result.Warnings.Add("服务读取失败："+name+"；"+error.Message);}
             }
             result.Software=platform is WindowsPlatform?SoftwareInventory.Read(result.Devices,result.Services,result.Warnings):platform.Software(result.Devices);
+            try {result.Startups=platform.StartupEntries();}
+            catch(Exception error){result.Warnings.Add("远控登录启动项读取失败："+error.Message);}
             try {result.BootId=platform.BootId;}
             catch(Exception error){result.Warnings.Add("启动时间读取失败："+error.Message);}
             return result;
