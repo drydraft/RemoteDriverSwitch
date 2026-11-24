@@ -1,0 +1,15 @@
+/build/
+/dist/
+/dist-*/
+*.zip
+*.exe
+*.pdb
+
+*.log
+state.json
+state.json.bak
+resume.json
+last-verification.json
+/实现与验证.md
+/恢复诊断_*.md
+/诊断记录_*.md
